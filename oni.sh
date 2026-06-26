@@ -1038,7 +1038,7 @@ register_task_definition() {
     local existing_sidecars
     existing_sidecars=$(fetch_existing_sidecar_containers)
     if [ "$existing_sidecars" != "[]" ]; then
-        all_containers=$(echo "$all_containers $existing_sidecars" | jq -s 'add')
+        all_containers=$(jq -n --argjson a "$all_containers" --argjson b "$existing_sidecars" '$a + $b')
     fi
 
     # Build task definition
