@@ -838,6 +838,44 @@ build_extra_containers() {
     echo "$extra_containers"
 }
 
+# Fetches sidecar containers from the currently active task definition and
+# returns all containers whose name does NOT match APP_SERVICE_NAME.
+# This preserves otel-sidecar, log_router, and any other containers injected
+# by IaC so that oni deploys only update the main application container.
+fetch_existing_sidecar_containers() {
+    log_info "Checking existing task definition for sidecar containers to preserve..."
+
+    local existing_td
+    existing_td=$(aws ecs describe-task-definition \
+        --region "$APP_REGION" \
+        --task-definition "${CLUSTER_NAME}-${APP_SERVICE_NAME}" \
+        --output json 2>/dev/null)
+
+    if [ $? -ne 0 ] || [ -z "$existing_td" ]; then
+        log_warning "No existing task definition found for ${CLUSTER_NAME}-${APP_SERVICE_NAME}, skipping sidecar preservation"
+        echo "[]"
+        return 0
+    fi
+
+    local sidecars
+    sidecars=$(echo "$existing_td" | jq --arg app "$APP_SERVICE_NAME" \
+        '.taskDefinition.containerDefinitions | map(select(.name != $app))')
+
+    local count
+    count=$(echo "$sidecars" | jq 'length')
+
+    if [ "$count" = "0" ]; then
+        log_info "No sidecar containers found in existing task definition"
+        echo "[]"
+        return 0
+    fi
+
+    local names
+    names=$(echo "$sidecars" | jq -r '[.[].name] | join(", ")')
+    log_info "Preserving $count sidecar container(s): $names"
+    echo "$sidecars"
+}
+
 # Function to get CloudWatch logs for failed containers
 get_failed_container_logs() {
     local task_id=$1
@@ -993,7 +1031,16 @@ register_task_definition() {
         log_info "Adding extra sidecar containers"
         all_containers=$(echo "$all_containers $extra_containers" | jq -s 'add')
     fi
-    
+
+    # Preserve sidecar containers (e.g. otel-sidecar, log_router) that were
+    # injected into the existing task definition by IaC. Only the main app
+    # container is updated; all other containers are carried forward as-is.
+    local existing_sidecars
+    existing_sidecars=$(fetch_existing_sidecar_containers)
+    if [ "$existing_sidecars" != "[]" ]; then
+        all_containers=$(echo "$all_containers $existing_sidecars" | jq -s 'add')
+    fi
+
     # Build task definition
     local task_def=$(jq -n \
         --arg family "${CLUSTER_NAME}-${APP_SERVICE_NAME}" \
