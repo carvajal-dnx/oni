@@ -28,6 +28,7 @@ DRY_RUN=false
 DISABLE_DEPLOY=false
 TIMEOUT=600
 ADD_XRAY_DAEMON=false
+ADD_SIGNOZ=false
 LAST_EVENT_ID=""
 LAST_TASK_ID=""
 ENABLE_SCAN=false
@@ -79,6 +80,8 @@ DEPLOY OPTIONS:
     --disable-deploy            Only register task definition
     --timeout SECONDS           Deployment timeout in seconds (default: 600)
     --add-xray                  Add X-Ray daemon and CloudWatch agent containers
+    --signoz                    Inject SigNoz/OTEL observability sidecars (otel-sidecar + log_router).
+                                Requires SIGNOZ_OTEL_SSM_ARN in oni.yaml for the app.
     -h, --help                  Show this help
 
 SECURITY SCAN OPTIONS:
@@ -366,7 +369,9 @@ load_config() {
     EXECUTION_ROLE_ARN=$(parse_yaml "$CONFIG_FILE" "$ENVIRONMENT" "$APP_NAME" "EXECUTION_ROLE_ARN")
     APP_ROLE=$(parse_yaml "$CONFIG_FILE" "$ENVIRONMENT" "$APP_NAME" "APP_ROLE")
     APP_SECRET_EXTRACT=$(parse_yaml "$CONFIG_FILE" "$ENVIRONMENT" "$APP_NAME" "APP_SECRET_EXTRACT")
-    
+    SIGNOZ_OTEL_SSM_ARN=$(parse_yaml "$CONFIG_FILE" "$ENVIRONMENT" "$APP_NAME" "SIGNOZ_OTEL_SSM_ARN")
+    SIGNOZ_LOG_GROUP=$(parse_yaml "$CONFIG_FILE" "$ENVIRONMENT" "$APP_NAME" "SIGNOZ_LOG_GROUP")
+
     # Set defaults if not specified
     [ -z "$APP_CPU" ] && APP_CPU="0"
     [ -z "$NETWORK_MODE" ] && NETWORK_MODE="awsvpc"
@@ -800,6 +805,59 @@ build_xray_containers() {
     echo "[$xray_daemon, $cw_agent]"
 }
 
+# Function to build SigNoz/OTEL observability sidecars (otel-sidecar + log_router).
+# Activated by --signoz flag. Requires SIGNOZ_OTEL_SSM_ARN in oni.yaml.
+# SIGNOZ_LOG_GROUP is optional and defaults to /ecs/<cluster>/<app>.
+build_signoz_containers() {
+    if [ "$ADD_SIGNOZ" = false ]; then
+        echo "[]"
+        return 0
+    fi
+
+    if [ -z "$SIGNOZ_OTEL_SSM_ARN" ] || [ "$SIGNOZ_OTEL_SSM_ARN" = "null" ]; then
+        log_error "SIGNOZ_OTEL_SSM_ARN is required in oni.yaml when using --signoz (app: $APP_SERVICE_NAME)"
+        exit 1
+    fi
+
+    local log_group="${SIGNOZ_LOG_GROUP:-/ecs/${CLUSTER_NAME}/${APP_SERVICE_NAME}}"
+
+    jq -n \
+        --arg otelSsmArn "$SIGNOZ_OTEL_SSM_ARN" \
+        --arg logGroup "$log_group" \
+        --arg region "$APP_REGION" \
+        '[
+            {
+                "name": "otel-sidecar",
+                "image": "otel/opentelemetry-collector-contrib:latest",
+                "essential": true,
+                "memory": 512,
+                "command": ["--config=env:OTEL_CONFIG_CONTENT"],
+                "secrets": [{"name": "OTEL_CONFIG_CONTENT", "valueFrom": $otelSsmArn}],
+                "logConfiguration": {
+                    "logDriver": "awslogs",
+                    "options": {
+                        "awslogs-group": $logGroup,
+                        "awslogs-region": $region,
+                        "awslogs-stream-prefix": "otel-sidecar"
+                    }
+                }
+            },
+            {
+                "name": "log_router",
+                "image": "public.ecr.aws/aws-observability/aws-for-fluent-bit:latest",
+                "essential": true,
+                "memoryReservation": 50,
+                "user": "0",
+                "links": ["otel-sidecar"],
+                "dependsOn": [{"containerName": "otel-sidecar", "condition": "START"}],
+                "firelensConfiguration": {
+                    "type": "fluentbit",
+                    "options": {"enable-ecs-log-metadata": "true"}
+                }
+            }
+        ]'
+}
+
 # Function to build extra containers (sidecars)
 build_extra_containers() {
     local extra_containers="[]"
@@ -1033,43 +1091,66 @@ register_task_definition() {
         all_containers=$(echo "$all_containers $extra_containers" | jq -s 'add')
     fi
 
-    # Preserve sidecar containers (e.g. otel-sidecar, log_router) that were
-    # injected into the existing task definition by IaC. Only the main app
-    # container is updated; all other containers are carried forward as-is.
-    local existing_sidecars
-    existing_sidecars=$(fetch_existing_sidecar_containers)
-    if [ "$existing_sidecars" != "[]" ] && [ -n "$existing_sidecars" ]; then
-        # Carry forward sidecar-integration fields from the existing app container
-        # (logConfiguration, links, dependsOn). Required when log_router uses
-        # firelensConfiguration — AWS mandates at least one container with awsfirelens,
-        # which the seed TD sets up. Without this, oni's default awslogs driver breaks.
-        local _existing_app_conf
-        _existing_app_conf=$(aws ecs describe-task-definition \
-            --region "$APP_REGION" \
-            --task-definition "${CLUSTER_NAME}-${APP_SERVICE_NAME}" \
-            --output json 2>/dev/null | \
-            jq --arg app "$APP_SERVICE_NAME" '
-                .taskDefinition.containerDefinitions[]
-                | select(.name == $app)
-                | {logConfiguration, links, dependsOn}
-                | with_entries(select(.value != null and .value != []))
-            ' 2>/dev/null) || true
-
-        if [ -n "$_existing_app_conf" ] && [ "$_existing_app_conf" != "null" ]; then
-            all_containers=$(echo "$all_containers" | jq \
-                --arg appName "$APP_SERVICE_NAME" \
-                --argjson conf "$_existing_app_conf" \
-                'map(if .name == $appName then . + $conf else . end)')
-        fi
-
-        # Concatenate sidecar containers (temp files avoid --argjson parsing issues)
+    # Inject SigNoz/OTEL observability containers when --signoz is passed.
+    # Builds otel-sidecar + log_router from oni.yaml config and switches the
+    # app container to awsfirelens log driver (required by log_router).
+    if [ "$ADD_SIGNOZ" = true ]; then
+        local signoz_containers
+        signoz_containers=$(build_signoz_containers)
+        log_info "Injecting SigNoz observability sidecars (otel-sidecar, log_router)"
+        all_containers=$(echo "$all_containers" | jq \
+            --arg appName "$APP_SERVICE_NAME" \
+            '{
+                logConfiguration: {
+                    logDriver: "awsfirelens",
+                    options: {"Name": "forward", "Host": "otel-sidecar", "Port": "24224"}
+                },
+                links: ["otel-sidecar"],
+                dependsOn: [{"containerName": "log_router", "condition": "START"}]
+            } as $signozConf |
+            map(if .name == $appName then . + $signozConf else . end)')
         local _tmp_a _tmp_b
         _tmp_a=$(mktemp)
         _tmp_b=$(mktemp)
         echo "$all_containers" > "$_tmp_a"
-        echo "$existing_sidecars" > "$_tmp_b"
+        echo "$signoz_containers" > "$_tmp_b"
         all_containers=$(jq -s '.[0] + .[1]' "$_tmp_a" "$_tmp_b")
         rm -f "$_tmp_a" "$_tmp_b"
+    else
+        # Preserve sidecar containers (e.g. otel-sidecar, log_router) that were
+        # injected into the existing task definition by IaC. Only the main app
+        # container is updated; all other containers are carried forward as-is.
+        # Skipped when --signoz is active (containers are built fresh instead).
+        local existing_sidecars
+        existing_sidecars=$(fetch_existing_sidecar_containers)
+        if [ "$existing_sidecars" != "[]" ] && [ -n "$existing_sidecars" ]; then
+            local _existing_app_conf
+            _existing_app_conf=$(aws ecs describe-task-definition \
+                --region "$APP_REGION" \
+                --task-definition "${CLUSTER_NAME}-${APP_SERVICE_NAME}" \
+                --output json 2>/dev/null | \
+                jq --arg app "$APP_SERVICE_NAME" '
+                    .taskDefinition.containerDefinitions[]
+                    | select(.name == $app)
+                    | {logConfiguration, links, dependsOn}
+                    | with_entries(select(.value != null and .value != []))
+                ' 2>/dev/null) || true
+
+            if [ -n "$_existing_app_conf" ] && [ "$_existing_app_conf" != "null" ]; then
+                all_containers=$(echo "$all_containers" | jq \
+                    --arg appName "$APP_SERVICE_NAME" \
+                    --argjson conf "$_existing_app_conf" \
+                    'map(if .name == $appName then . + $conf else . end)')
+            fi
+
+            local _tmp_a _tmp_b
+            _tmp_a=$(mktemp)
+            _tmp_b=$(mktemp)
+            echo "$all_containers" > "$_tmp_a"
+            echo "$existing_sidecars" > "$_tmp_b"
+            all_containers=$(jq -s '.[0] + .[1]' "$_tmp_a" "$_tmp_b")
+            rm -f "$_tmp_a" "$_tmp_b"
+        fi
     fi
 
     # Build task definition
@@ -1650,6 +1731,10 @@ parse_args() {
                 ;;
             --add-xray)
                 ADD_XRAY_DAEMON=true
+                shift
+                ;;
+            --signoz)
+                ADD_SIGNOZ=true
                 shift
                 ;;
             --scan)
