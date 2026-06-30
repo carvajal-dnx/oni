@@ -400,11 +400,12 @@ assume_iam_role() {
     local role_arn="arn:aws:iam::${APP_ACCOUNT}:role/${APP_ROLE}"
     local session_name="bobctl-$(date +%s)"
     
-    local credentials=$(aws sts assume-role \
+    local credentials
+    credentials=$(aws sts assume-role \
         --role-arn "$role_arn" \
         --role-session-name "$session_name" \
         --output json)
-    
+
     export AWS_ACCESS_KEY_ID=$(echo "$credentials" | jq -r '.Credentials.AccessKeyId')
     export AWS_SECRET_ACCESS_KEY=$(echo "$credentials" | jq -r '.Credentials.SecretAccessKey')
     export AWS_SESSION_TOKEN=$(echo "$credentials" | jq -r '.Credentials.SessionToken')
@@ -1037,8 +1038,14 @@ register_task_definition() {
     # container is updated; all other containers are carried forward as-is.
     local existing_sidecars
     existing_sidecars=$(fetch_existing_sidecar_containers)
-    if [ "$existing_sidecars" != "[]" ]; then
-        all_containers=$(jq -n --argjson a "$all_containers" --argjson b "$existing_sidecars" '$a + $b')
+    if [ "$existing_sidecars" != "[]" ] && [ -n "$existing_sidecars" ]; then
+        local _tmp_a _tmp_b
+        _tmp_a=$(mktemp)
+        _tmp_b=$(mktemp)
+        echo "$all_containers" > "$_tmp_a"
+        echo "$existing_sidecars" > "$_tmp_b"
+        all_containers=$(jq -s 'add' "$_tmp_a" "$_tmp_b")
+        rm -f "$_tmp_a" "$_tmp_b"
     fi
 
     # Build task definition
@@ -1103,13 +1110,12 @@ register_task_definition() {
     echo $task_def > output.json
 
     # Register task definition
-    local result=$(aws ecs register-task-definition \
+    local result
+    result=$(aws ecs register-task-definition \
         --region "$APP_REGION" \
         --cli-input-json "$task_def" \
         --output json 2>&1)
 
-    
-    
     if [ $? -ne 0 ]; then
         log_error "Failed to register task definition:"
         log_error "Input JSON: $task_def"
@@ -1167,16 +1173,18 @@ deploy_worker() {
 
     cmd="$cmd --output json"
 
-    local result=$(eval "$cmd" 2>&1)
-    
+    local result
+    result=$(eval "$cmd" 2>&1)
+
     if [ $? -ne 0 ]; then
         log_error "Failed to update service:"
         echo "$result" >&2
         exit 1
     fi
-    
-    local service_status=$(echo "$result" | jq -r '.service.status')
-    
+
+    local service_status
+    service_status=$(echo "$result" | jq -r '.service.status')
+
     if [ "$service_status" = "ACTIVE" ]; then
         log_success "Service updated successfully"
         log_success "Deployment completed for $APP_SERVICE_NAME"
@@ -1229,17 +1237,19 @@ deploy_with_loadbalancer() {
     fi
     
     cmd="$cmd --output json"
-    
-    local result=$(eval "$cmd" 2>&1)
-    
+
+    local result
+    result=$(eval "$cmd" 2>&1)
+
     if [ $? -ne 0 ]; then
         log_error "Failed to update service:"
         echo "$result" >&2
         exit 1
     fi
-    
-    local service_status=$(echo "$result" | jq -r '.service.status')
-    
+
+    local service_status
+    service_status=$(echo "$result" | jq -r '.service.status')
+
     if [ "$service_status" = "ACTIVE" ]; then
         log_success "Service updated successfully"
         monitor_deployment
@@ -1517,7 +1527,8 @@ deploy() {
     fi
     
     # Register task definition
-    local task_arn=$(register_task_definition)
+    local task_arn
+    task_arn=$(register_task_definition)
     
     if [ "$DISABLE_DEPLOY" = true ]; then
         log_info "Deployment disabled. Task definition registered only."
