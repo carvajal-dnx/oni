@@ -1039,12 +1039,36 @@ register_task_definition() {
     local existing_sidecars
     existing_sidecars=$(fetch_existing_sidecar_containers)
     if [ "$existing_sidecars" != "[]" ] && [ -n "$existing_sidecars" ]; then
+        # Carry forward sidecar-integration fields from the existing app container
+        # (logConfiguration, links, dependsOn). Required when log_router uses
+        # firelensConfiguration — AWS mandates at least one container with awsfirelens,
+        # which the seed TD sets up. Without this, oni's default awslogs driver breaks.
+        local _existing_app_conf
+        _existing_app_conf=$(aws ecs describe-task-definition \
+            --region "$APP_REGION" \
+            --task-definition "${CLUSTER_NAME}-${APP_SERVICE_NAME}" \
+            --output json 2>/dev/null | \
+            jq --arg app "$APP_SERVICE_NAME" '
+                .taskDefinition.containerDefinitions[]
+                | select(.name == $app)
+                | {logConfiguration, links, dependsOn}
+                | with_entries(select(.value != null and .value != []))
+            ' 2>/dev/null) || true
+
+        if [ -n "$_existing_app_conf" ] && [ "$_existing_app_conf" != "null" ]; then
+            all_containers=$(echo "$all_containers" | jq \
+                --arg appName "$APP_SERVICE_NAME" \
+                --argjson conf "$_existing_app_conf" \
+                'map(if .name == $appName then . + $conf else . end)')
+        fi
+
+        # Concatenate sidecar containers (temp files avoid --argjson parsing issues)
         local _tmp_a _tmp_b
         _tmp_a=$(mktemp)
         _tmp_b=$(mktemp)
         echo "$all_containers" > "$_tmp_a"
         echo "$existing_sidecars" > "$_tmp_b"
-        all_containers=$(jq -s 'add' "$_tmp_a" "$_tmp_b")
+        all_containers=$(jq -s '.[0] + .[1]' "$_tmp_a" "$_tmp_b")
         rm -f "$_tmp_a" "$_tmp_b"
     fi
 
