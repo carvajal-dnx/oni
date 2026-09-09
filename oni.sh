@@ -821,10 +821,16 @@ build_signoz_containers() {
 
     local log_group="${SIGNOZ_LOG_GROUP:-/ecs/${CLUSTER_NAME}/${APP_SERVICE_NAME}}"
 
+    local use_awsvpc=false
+    if [ "$NETWORK_MODE" = "awsvpc" ] || [ "$FARGATE" = true ]; then
+        use_awsvpc=true
+    fi
+
     jq -n \
         --arg otelSsmArn "$SIGNOZ_OTEL_SSM_ARN" \
         --arg logGroup "$log_group" \
         --arg region "$APP_REGION" \
+        --argjson useAwsvpc "$use_awsvpc" \
         '[
             {
                 "name": "otel-sidecar",
@@ -842,19 +848,21 @@ build_signoz_containers() {
                     }
                 }
             },
-            {
-                "name": "log_router",
-                "image": "public.ecr.aws/aws-observability/aws-for-fluent-bit:latest",
-                "essential": true,
-                "memoryReservation": 50,
-                "user": "0",
-                "links": ["otel-sidecar"],
-                "dependsOn": [{"containerName": "otel-sidecar", "condition": "START"}],
-                "firelensConfiguration": {
-                    "type": "fluentbit",
-                    "options": {"enable-ecs-log-metadata": "true"}
+            (
+                {
+                    "name": "log_router",
+                    "image": "public.ecr.aws/aws-observability/aws-for-fluent-bit:latest",
+                    "essential": true,
+                    "memoryReservation": 50,
+                    "user": "0",
+                    "dependsOn": [{"containerName": "otel-sidecar", "condition": "START"}],
+                    "firelensConfiguration": {
+                        "type": "fluentbit",
+                        "options": {"enable-ecs-log-metadata": "true"}
+                    }
                 }
-            }
+                + (if $useAwsvpc then {} else {"links": ["otel-sidecar"]} end)
+            )
         ]'
 }
 
@@ -1097,17 +1105,34 @@ register_task_definition() {
     if [ "$ADD_SIGNOZ" = true ]; then
         local signoz_containers
         signoz_containers=$(build_signoz_containers)
+
+        local use_awsvpc=false
+        local signoz_host="otel-sidecar"
+        local signoz_port="24224"
+        if [ "$NETWORK_MODE" = "awsvpc" ] || [ "$FARGATE" = true ]; then
+            use_awsvpc=true
+            signoz_host="localhost"
+            signoz_port="24225"
+        fi
+
         log_info "Injecting SigNoz observability sidecars (otel-sidecar, log_router)"
+        log_info "Network mode: $NETWORK_MODE | OTEL target: ${signoz_host}:${signoz_port}"
+
         all_containers=$(echo "$all_containers" | jq \
             --arg appName "$APP_SERVICE_NAME" \
-            '{
-                logConfiguration: {
-                    logDriver: "awsfirelens",
-                    options: {"Name": "forward", "Host": "otel-sidecar", "Port": "24224"}
-                },
-                links: ["otel-sidecar"],
-                dependsOn: [{"containerName": "log_router", "condition": "START"}]
-            } as $signozConf |
+            --arg host "$signoz_host" \
+            --arg port "$signoz_port" \
+            --argjson useAwsvpc "$use_awsvpc" \
+            '(
+                {
+                    logConfiguration: {
+                        logDriver: "awsfirelens",
+                        options: {"Name": "forward", "Host": $host, "Port": $port}
+                    },
+                    dependsOn: [{"containerName": "log_router", "condition": "START"}]
+                }
+                + (if $useAwsvpc then {} else {links: ["otel-sidecar"]} end)
+            ) as $signozConf |
             map(if .name == $appName then . + $signozConf else . end)')
         local _tmp_a _tmp_b
         _tmp_a=$(mktemp)
