@@ -1319,7 +1319,7 @@ deploy_with_loadbalancer() {
         })')
         
         local escaped_json=$(echo "$capacity_providers_json" | jq -c '.')
-        capacity_strategy_flag="--capacity-provider-strategy $escaped_json"
+        capacity_strategy_flag="--capacity-provider-strategy '$escaped_json'"
     fi
     
     if [ "$DRY_RUN" = true ]; then
